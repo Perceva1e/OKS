@@ -3,6 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 import time
+import random
 
 # Define ports
 ports = ['COM1', 'COM2', 'COM3', 'COM4']
@@ -22,18 +23,57 @@ is_receiving = True  # Global flag to control reception
 # Mutex for serial port access
 port_lock = threading.Lock()
 
-
 # Frame structure class
 class Frame:
     def __init__(self, source_address, data):
         self.flag = bin(n)[2:].zfill(8)  # Binary flag
         self.destination_address = '0000'  # Zero address
         self.source_address = bin(int(source_address[-1]))[2:].zfill(4)
-        self.data = data.ljust(data_length, '0')
+
+        # Ensure data is padded to the required length
+        self.data = data.ljust(data_length - 1, '0')  # Pad to data_length - 1
+
+        # Hamming code generation
+        self.hamming_code = self.generate_hamming_code(self.data)
+        self.fcs = self.hamming_code  # Set FCS to the Hamming code
 
         # Data encoding and bit stuffing
         self.stuffed_data, self.stuffed_bit_position = self.perform_bit_stuffing(self.data)
-        self.fcs = '00000000'  # Zero FCS
+
+    def generate_hamming_code(self, data):
+        """Generate Hamming code for error detection and correction."""
+        data_bits = list(map(int, data))
+        m = len(data_bits)
+        r = 0
+
+        # Calculate number of parity bits required
+        while (2 ** r) < (m + r + 1):
+            r += 1
+
+        # Create a list for hamming code including parity bits
+        hamming_code = [0] * (m + r)
+
+        # Position parity bits
+        j = 0
+        for i in range(1, m + r + 1):
+            if i == (2 ** j):
+                j += 1  # Skip parity positions
+            else:
+                hamming_code[i - 1] = data_bits[i - j - 1]
+
+        # Calculate parity bits
+        for i in range(r):
+            parity_position = 2 ** i
+            parity_value = 0
+            for k in range(1, m + r + 1):
+                if k & parity_position:
+                    parity_value ^= hamming_code[k - 1]
+            hamming_code[parity_position - 1] = parity_value
+
+        # Отладочный вывод
+        print(f"Generated Hamming Code: {''.join(map(str, hamming_code))}")
+
+        return ''.join(map(str, hamming_code))
 
     def perform_bit_stuffing(self, data):
         stuffed_data = ""
@@ -67,65 +107,130 @@ class Frame:
             f"FCS: {self.fcs}"
         )
 
+def corrupt_data(data):
+    """Corrupt data based on specified probabilities."""
+    data_bits = list(data)
+
+    # Randomly corrupt one bit with 60% probability
+    if random.random() < 0.6:
+        index = random.randint(0, len(data_bits) - 1)
+        data_bits[index] = '1' if data_bits[index] == '0' else '0'
+
+    # Randomly corrupt two bits with 25% probability
+    if random.random() < 0.25:
+        indices = random.sample(range(len(data_bits)), 2)
+        for index in indices:
+            data_bits[index] = '1' if data_bits[index] == '0' else '0'
+
+    return ''.join(data_bits)
+
 
 def transmit(port, data, baudrate):
     global byte_count_tx1, byte_count_tx2
     frame = Frame(port, data)  # Create frame
     frame_string = frame.to_string() + "\n"
 
-    output_widget = output_text1 if port == 'COM1' else output_text2
+    # Temporarily disable corruption for testing
+    corrupted_data = frame.data  # Use original data for testing
+    frame_with_correction = Frame(port, corrupted_data)
+    corrupted_frame_string = frame_with_correction.to_string() + "\n"
 
-    output_widget.insert(tk.END, f"Transmitting on {port}: {frame_string.strip()}")
-    output_widget.see(tk.END)
+    print(f"Transmitting on {port}: {corrupted_frame_string.strip()}")
 
-    print(f"Transmitting on {port}: {frame_string.strip()}")  # Console output
+    # Log the sent frame in the appropriate output window
+    if port == 'COM1':
+        output_text1.insert(tk.END, f"Transmitting on {port}: {corrupted_frame_string.strip()}\n")
+    elif port == 'COM3':
+        output_text2.insert(tk.END, f"Transmitting on {port}: {corrupted_frame_string.strip()}\n")
 
     with port_lock:  # Ensure exclusive access to the serial port
         try:
             with serial.Serial(port, baudrate) as ser:
-                ser.write(frame_string.encode())
+                ser.write(corrupted_frame_string.encode())
                 if port == 'COM1':
-                    byte_count_tx1 += len(frame_string.encode())
+                    byte_count_tx1 += len(corrupted_frame_string.encode())
                 elif port == 'COM3':
-                    byte_count_tx2 += len(frame_string.encode())
+                    byte_count_tx2 += len(corrupted_frame_string.encode())
 
-                # Вызов обновления статуса после отправки данных
+                # Update status after sending data
                 update_status()
         except serial.SerialException as e:
-            output_widget.insert(tk.END, f"Error opening port {port}: {str(e)}\n")
-            output_widget.see(tk.END)
-            print(f"Error opening port {port}: {str(e)}")  # More detailed console output
+            print(f"Error opening port {port}: {str(e)}")
 
+
+def decode_hamming_code(received_data):
+    received_bits = list(map(int, received_data))
+    m = len(received_bits)
+    r = 0
+
+    # Определите количество бит четности
+    while (2 ** r) < (m + 1):
+        r += 1
+
+    error_position = 0
+    for i in range(r):
+        parity_position = 2 ** i
+        parity_value = 0
+        for j in range(1, m + 1):
+            if j & parity_position:
+                parity_value ^= received_bits[j - 1]
+        if parity_value != 0:
+            error_position += parity_position
+
+    if error_position:
+        received_bits[error_position - 1] ^= 1  # Исправьте ошибку
+
+    data_bits = []
+    j = 0
+    for i in range(m):
+        if (i + 1) != (2 ** j):
+            data_bits.append(received_bits[i])
+        else:
+            j += 1
+
+    # Убедитесь, что данные корректно извлечены
+    decoded_data = ''.join(map(str, data_bits)).rstrip('0')  # Удалите лишние нули
+    print(f"Decoded Data after extraction: {decoded_data}")
+
+    return decoded_data
 
 def receive(port, output_widget, baudrate):
-    global byte_count_rx1, byte_count_rx2, is_receiving  # Объявляем глобальные переменные
+    global byte_count_rx1, byte_count_rx2, is_receiving
 
-    print(f"Listening on {port}...")  # Отладочное сообщение
+    print(f"Listening on {port}...")  # Debug message
     try:
         with serial.Serial(port, baudrate) as ser:
-            while is_receiving:  # Цикл продолжается, пока флаг True
+            while is_receiving:
                 try:
-                    data = ser.readline()  # Чтение данных из порта
-                    if data:  # Проверяем, есть ли данные
-                        print(f"Raw data received on {port}: {data}")  # Отладочное сообщение
+                    data = ser.readline()
+                    if data:
+                        print(f"Raw data received on {port}: {data}")  # Debug message
 
-                        # Увеличиваем счетчики байтов после успешного приема
+                        # Increase byte counters
                         if port == 'COM2':
                             byte_count_rx1 += len(data)
                         elif port == 'COM4':
                             byte_count_rx2 += len(data)
 
-                        # Обновляем статус после приема данных
-                        update_status()
+                        # Decode and recover the data
+                        received_frame = data.decode().strip()
+                        print(f"Received Frame: {received_frame}")  # Debug output
 
-                        # Выводим данные в соответствующее окно
-                        output_widget.insert(tk.END, f"Received on {port}: {data.decode().strip()}\n")
+                        # Extract FCS and decode data
+                        fcs_received = received_frame.split(', ')[-1].split(': ')[1]
+                        data_received = decode_hamming_code(fcs_received)
+
+                        # Log the received frame in the output widget
+                        output_widget.insert(tk.END, f"Received on {port}: {received_frame}\n")
                         output_widget.see(tk.END)
 
+                        # Log the decoded data in the console
+                        print(f"Decoded Data: {data_received}")  # Debug output
+
                 except Exception as e:
-                    print(f"Error while reading data on {port}: {str(e)}")  # Сообщение об ошибке чтения
+                    print(f"Error while reading data on {port}: {str(e)}")
     except serial.SerialException as e:
-        print(f"Error opening port {port}: {str(e)}")  # Сообщение об ошибке открытия порта
+        print(f"Error opening port {port}: {str(e)}")
 
 
 def update_status():
@@ -212,7 +317,30 @@ def send_data2():
         if binary_data:  # Check for non-empty string
             start_communication("", binary_data)
 
+def test_hamming_code():
+    original_data = "1011001"  # Example binary data
+    frame = Frame("COM1", original_data)
 
+    # Print original data and its Hamming code
+    print(f"Original Data: {original_data}")
+    print(f"Hamming Code (FCS): {frame.fcs}")
+
+    # Simulate data corruption
+    corrupted_data = corrupt_data(original_data)
+    print(f"Corrupted Data: {corrupted_data}")
+
+    # Decode the corrupted data using Hamming code
+    decoded_data = decode_hamming_code(corrupted_data)
+    print(f"Decoded Data: {decoded_data}")
+
+    # Check if the decoded data is the same as the original
+    if decoded_data == original_data:
+        print("Test Passed: Decoded data matches the original data.")
+    else:
+        print("Test Failed: Decoded data does not match the original data.")
+
+# Run the test
+test_hamming_code()
 # Create main window
 root = tk.Tk()
 root.title("Serial Communication Interface")
